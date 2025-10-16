@@ -70,11 +70,26 @@ class UnitTokeniser(AudioTokeniser):
 
     @torch.inference_mode()
     def tokenise(self, wav: torch.Tensor, lens: Optional[torch.Tensor] = None) -> BatchEncoding:
+        # === custom pt token loading ===
+        if not wav.is_floating_point():
+            # "wav" is actually unit ids
+            units = wav
+            reps = [{'units': u[:l].tolist()} for u, l in zip(units, lens)]
+            token_str = self.stringify_representation(reps)
+            return self.string_tokenise(token_str, return_tensors='pt', padding=True)
         return self.string_tokenise(self.audio_stringify(wav, lens), return_tensors='pt', padding=True)
 
     def build_prompt(self, wav: torch.Tensor, lens: Optional[torch.Tensor] = None,
                      output_modality: Optional[str] = None) -> BatchEncoding:
-        tokens = self.string_tokenise(self.audio_stringify(wav, lens), return_tensors='pt', padding=True)
+        # === custom pt token loading ===
+        if not wav.is_floating_point():
+            # "wav" is actually unit ids
+            units = wav
+            reps = [{'units': u.tolist()} for u in units]
+            token_str = self.stringify_representation(reps)
+            tokens = self.string_tokenise(token_str, return_tensors='pt', padding=True)
+        else:
+            tokens = self.string_tokenise(self.audio_stringify(wav, lens), return_tensors='pt', padding=True)
         # remove eos and irrelevant keys
         tokens = {k: v[...,:-1] for k, v in tokens.items() if k != "token_type_ids"}
         return BatchEncoding(tokens)

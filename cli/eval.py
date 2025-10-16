@@ -6,7 +6,7 @@ from slamkit.vocoder import vocoder_factory
 from slamkit.model import tlm_factory
 from slamkit.tokeniser import tokeniser_factory
 from slamkit.metric.generative_metric import generate, asr_perplexity, llm_as_judge
-from slamkit.metric.modelling_metric import swuggy, salmon, sblimp, storycloze
+from slamkit.metric.modelling_metric import swuggy, salmon, sblimp, storycloze, tsp
 from slamkit.model import SpeechLM
 import torch
 import logging
@@ -43,6 +43,8 @@ def main(cfg: DictConfig):
                 res = storycloze(model, path, used_token_modality, mean_nll, cfg.batch_size, cfg.num_workers, cfg.pin_memory, cfg.metric.get("subfolder", False))
             elif cfg.metric.metric_type == 'salmon':
                 res = salmon(model, path, used_token_modality, mean_nll, cfg.metric.parts, cfg.batch_size, cfg.num_workers, cfg.pin_memory)
+            elif cfg.metric.metric_type == 'tsp':
+                res = tsp(model, path, used_token_modality, mean_nll, cfg.batch_size, cfg.num_workers, cfg.pin_memory)
             elif cfg.metric.metric_type == 'generate':
                 if cfg.vocoder.vocoder_type is None:
                     logger.warning("You are currently trying to run generation without a vocoder, which will generate tokens, but has no effect. You can use a vocoder by, e.g. setting `vocoder=vocoder_hubert_25`")
@@ -84,9 +86,10 @@ def main(cfg: DictConfig):
                     print(f"\t{i}: {v}")
             else:
                 print(f"{key}: {val}")
-    if cfg.metric.get("out_path", False) and "generate" in res and cfg.vocoder.vocoder_type is not None:
+    if cfg.metric.get("out_path", False) and "generate" in res:
         import torchaudio
         os.makedirs(cfg.metric.out_path, exist_ok=True)
+        generated_unit_dict = {}
         for i, gen in enumerate(res["generate"]):
             if i == cfg.metric.get("num_log", -1):
                 print(f"Only saving first {i} samples")
@@ -95,11 +98,19 @@ def main(cfg: DictConfig):
                 out_path = os.path.join(cfg.metric.out_path, f"{cfg.metric.metric_type}_{i}.txt")
                 with open(out_path, "w") as f:
                     f.write(gen)
-            else:  # Audio output
+            elif cfg.vocoder.vocoder_type is not None:  # Audio output
                 if gen.shape[-1] == 0:
                     continue
                 out_path = os.path.join(cfg.metric.out_path, f"{cfg.metric.metric_type}_{i}.{cfg.metric.ext}")
                 torchaudio.save(out_path, gen.cpu().unsqueeze(0), tokeniser.fe_sample_rate)
+            else:  # Unit output
+                generated_unit_dict[res["files"][i]] = gen
+        
+        # === custom save unit output as .pt file ===
+        if len(generated_unit_dict) > 0:
+            out_path = os.path.join(cfg.metric.out_path, f"{cfg.metric.metric_type}.pt")
+            torch.save(generated_unit_dict, out_path)
+            logger.info(f"Saved generated units to {out_path}")
 
     if cfg.logger.report_to == "wandb":
         import wandb

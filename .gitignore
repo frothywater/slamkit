@@ -171,3 +171,4 @@ data
 dpo_data
 cli/wandb
 *.wav
+generated/

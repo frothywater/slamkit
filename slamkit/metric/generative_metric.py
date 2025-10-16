@@ -35,20 +35,30 @@ class PromptDataset(Dataset):
     def __init__(self, glob_path, prompt_length=None, sample_rate=16000, num_files=None, min_file_length=None, use_alignment=False, alignment_folder=None):
         self.prompt_length = prompt_length
         self.sample_rate = sample_rate
-        if num_files is None:
-            self.data = glob(glob_path, recursive=True)
-            if min_file_length is not None:
-                self.data = list(filter(lambda x: not is_shorter(x, min_file_length), self.data))
+        
+        # === custom .pt token loading ===
+        if glob_path.endswith(".pt"):
+            self.data_type = "tensor"
+            self.tensor_dict = torch.load(glob_path)
+            self.data = list(self.tensor_dict.keys())
+            if num_files is not None:
+                self.data = self.data[:num_files]
         else:
-            self.data = []
-            paths = iglob(glob_path, recursive=True)
-            for path in paths:
-                if len(self.data) >= num_files:
-                    break
+            self.data_type = "audio"
+            if num_files is None:
+                self.data = glob(glob_path, recursive=True)
                 if min_file_length is not None:
-                    if is_shorter(path, min_file_length):
-                        continue
-                self.data.append(path)
+                    self.data = list(filter(lambda x: not is_shorter(x, min_file_length), self.data))
+            else:
+                self.data = []
+                paths = iglob(glob_path, recursive=True)
+                for path in paths:
+                    if len(self.data) >= num_files:
+                        break
+                    if min_file_length is not None:
+                        if is_shorter(path, min_file_length):
+                            continue
+                    self.data.append(path)
         self.use_alignment = use_alignment
         self.alignment_folder = alignment_folder
 
@@ -57,21 +67,31 @@ class PromptDataset(Dataset):
 
     def __getitem__(self, idx):
         file = self.data[idx]
-        audio, sr = torchaudio.load(file)
-        if sr != self.sample_rate:
-            audio = torchaudio.functional.resample(audio, sr, self.sample_rate)
-        if audio.ndim == 2:
-            audio = audio.mean(dim=0)
-        if self.prompt_length is not None and not self.use_alignment:
-            audio = audio[:int(self.prompt_length*self.sample_rate)]
-        elif self.prompt_length is not None and self.use_alignment:
-            alignment_path = self.get_alignment_path(file)
-            with open(alignment_path, 'r') as f:
-                meta = json.load(f)
-                alignment = meta['aligned_text']
-            prompt_length = get_cut_location(alignment, self.prompt_length)
-            audio = audio[:int(prompt_length*self.sample_rate)]
-        return audio, audio.shape[-1]
+        
+        # === custom .pt token loading ===
+        if self.data_type == "tensor":
+            units = self.tensor_dict[file]
+            if units.dim() == 2:
+                units = units.squeeze(0)
+            if self.prompt_length is not None:
+                units = units[:self.prompt_length]
+            return units, units.shape[-1], file
+        else:
+            audio, sr = torchaudio.load(file)
+            if sr != self.sample_rate:
+                audio = torchaudio.functional.resample(audio, sr, self.sample_rate)
+            if audio.ndim == 2:
+                audio = audio.mean(dim=0)
+            if self.prompt_length is not None and not self.use_alignment:
+                audio = audio[:int(self.prompt_length*self.sample_rate)]
+            elif self.prompt_length is not None and self.use_alignment:
+                alignment_path = self.get_alignment_path(file)
+                with open(alignment_path, 'r') as f:
+                    meta = json.load(f)
+                    alignment = meta['aligned_text']
+                prompt_length = get_cut_location(alignment, self.prompt_length)
+                audio = audio[:int(prompt_length*self.sample_rate)]
+            return audio, audio.shape[-1], file
     
     def get_alignment_path(self, file:str):
         if self.alignment_folder is None:
@@ -81,9 +101,9 @@ class PromptDataset(Dataset):
         return alignment_path
 
 def pad_collate(batch):
-    audio, l = zip(*batch)
+    audio, l, files = zip(*batch)
     audio = pad_sequence(audio, batch_first=True, padding_value=0)
-    return audio, torch.tensor(l)
+    return audio, torch.tensor(l), files
 
 
 def generate(model: SpeechLM, data_path: str, batch_size: int, used_tokens_modality:Optional[str] = None, prompt_length: Optional[int] = None, 
@@ -98,12 +118,14 @@ def generate(model: SpeechLM, data_path: str, batch_size: int, used_tokens_modal
                     num_workers=num_workers, pin_memory=pin_memory)
     res = []
     prompts = []
+    files = []
     with torch.inference_mode():
-        for audio, l in tqdm(dl):
+        for audio, l, file in tqdm(dl):
             audio = audio.to(model.device)
             res.extend(model.generate(audio, l, used_tokens_modality, **generate_kwargs))
             prompts.extend(audio)
-    return {'generate': res, "prompts": prompts}
+            files.extend(file)
+    return {'generate': res, "prompts": prompts, "files": files}
         
 def asr_perplexity(model: SpeechLM, data_path: str, batch_size: int, whisper_model: str, llm_name_or_path: str, used_tokens_modality:Optional[str] = None,
                    prompt_length: Optional[int] = None, min_file_length: Optional[int] = None, alignment_folder: Optional[str] = None, use_alignment: bool = False,
@@ -120,7 +142,7 @@ def asr_perplexity(model: SpeechLM, data_path: str, batch_size: int, whisper_mod
     whisper_pipeline = get_whisper_pipeline(whisper_model, device=model.device)
     llm, text_lm_tokeniser = get_llm(llm_name_or_path, device=model.device)
     nlls, gen, prompts, bleus = [], [], [], []
-    for audio, l in tqdm(dl):
+    for audio, l, file in tqdm(dl):
         audio = audio.to(model.device)
         gen_res = model.generate(audio, l, used_tokens_modality, **generate_kwargs)
         gen.extend(gen_res)
@@ -150,7 +172,7 @@ def llm_as_judge(model: SpeechLM, data_path: str, batch_size: int, whisper_model
     judge = get_judge(llm_name_or_path, device=model.device, batch_size=batch_size)
     res, gen, prompts, texts = [], [], [], []
     prompt_texts, gen_texts = [], []
-    for audio, l in tqdm(dl, desc="Generating"):
+    for audio, l, file in tqdm(dl, desc="Generating"):
         audio = audio.to(model.device)
         gen_res = model.generate(audio, l, used_tokens_modality, remove_prompt=True, **generate_kwargs)
         gen.extend(gen_res)
